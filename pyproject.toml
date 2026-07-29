@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "Cython>=3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parquet-footer-benchmarks-2026"
+version = "0.1.0"
+description = "Parquet footer format benchmarks (depth/stat projection sweeps) with a native Apache Thrift C++ decoder"
+requires-python = ">=3.10"
+dependencies = [
+    "thriftpy2",
+    "flatbuffers",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "matplotlib",
+    "palletjack",
+    "humanize",
+]
+
+# The native decoder additionally needs, at build time, the Apache Thrift compiler and
+# the C++ runtime/headers (not installable via pip):
+#   apt-get install thrift-compiler libthrift-dev
+# The compiler version should match the installed libthrift.
+# The flatbuffers format needs the FlatBuffers compiler (matching libflatbuffers-dev) and lz4
+# headers at build time; flatc generates both the Python accessors (flatbuffers_gen/) and the
+# native reader's C++ header:
+#   apt-get install flatbuffers-compiler libflatbuffers-dev liblz4-dev
+
+[tool.setuptools]
+# Single-module driver; the native_readers extension is defined dynamically in setup.py
+# because it requires the thrift codegen step to run first.
+py-modules = ["parquet_footer_benchmarks_2026"]

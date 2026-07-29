@@ -1,0 +1,6 @@
+/build
+/flatbuffers_gen
+/native_build
+/palletjack_cache
+/__pycache__
+*.so

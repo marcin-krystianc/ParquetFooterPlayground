@@ -1,0 +1,52 @@
+// Core footer, FlatBuffers variant of the struct-of-arrays layout (Option 3 / soa).
+//
+// Same information as footer-core-soa.thrift: schema matrix + row-group matrix +
+// column-chunk matrix, each field a parallel vector indexed by chunk (column-major:
+// chunk index = column * row_groups + row_group). FlatBuffers vectors are directly
+// addressable without a decode pass, so a projected read touches only the two vectors
+// it needs (data_page_offsets, total_compressed_sizes) at only the selected indices;
+// the schema, row-group, and statistics vectors are never read. This is the FlatBuffers
+// analogue of the Arrow-IPC soa_ipc reader.
+
+namespace FooterCoreFb;
+
+// Wrapper for a variable-length byte blob (FlatBuffers has no nested [[ubyte]]).
+// Used for per-node LogicalType bytes and per-chunk min/max statistic values.
+table ByteBlob {
+  data:[ubyte];
+}
+
+table SchemaMatrix {
+  names:[string];
+  physical_types:[int];
+  repetition_types:[int];
+  logical_types:[ByteBlob];   // compact-thrift-serialized LogicalType union per node
+  type_lengths:[int];
+  num_children:[int];
+  field_ids:[int];
+}
+
+table RowGroupMatrix {
+  num_rows:[long];
+}
+
+table ColumnChunkMatrix {
+  data_page_offsets:[long];
+  dictionary_page_offsets:[long];
+  total_compressed_sizes:[long];
+  total_uncompressed_sizes:[long];
+  num_values:[long];
+  codecs:[int];
+  stat_min_values:[ByteBlob];
+  stat_max_values:[ByteBlob];
+  stat_null_counts:[long];
+}
+
+table FileMetaData {
+  layout_version:int;
+  schema:SchemaMatrix;
+  row_groups:RowGroupMatrix;
+  chunks:ColumnChunkMatrix;
+}
+
+root_type FileMetaData;
