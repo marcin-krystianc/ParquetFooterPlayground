@@ -1,3 +1,6 @@
+### Previous versions: 
+- [v2026-08](https://github.com/marcin-krystianc/ParquetFooterPlayground/tree/v2026-08)
+
 # Parquet footer benchmarks (2026)
 
 Parquet ([file format docs](https://parquet.apache.org/docs/file-format/)) stores its metadata
@@ -91,6 +94,51 @@ wanted chunks.
   metadata. Read fetches only the selected row groups/columns through the index instead of
   parsing the whole footer, so it accelerates the pyarrow baseline and converges to it as the
   projection approaches 100%.
+
+### current vs soa layout
+
+Note, that these diagrams show only the placement-info fields this benchmark reads.
+See `footer-core-current.thrift` and `footer-core-soa.thrift` for the full
+field lists.
+
+- `current` is array-of-structs: one `ColumnMetaData` struct per chunk, each carrying its own
+copy of every field.
+
+```text
+FileMetaData
+|
++-- row_groups[0]
+|     +-- columns[0].meta_data -> ColumnMetaData { type, encodings, path_in_schema, codec,
+|     |                             num_values, total_uncompressed_size,
+|     |                             total_compressed_size, data_page_offset, ... }
+|     +-- columns[1].meta_data -> ColumnMetaData { same fields, own copy }
+|     +-- columns[N].meta_data -> ColumnMetaData { same fields, own copy }
+|
++-- row_groups[1]
+|     +-- columns[0].meta_data -> ColumnMetaData { ... }
+|     +-- columns[1].meta_data -> ColumnMetaData { ... }
+|     +-- columns[N].meta_data -> ColumnMetaData { ... }
+|
++-- row_groups[G] ...
+```
+
+- `soa` is struct-of-arrays: one parallel array per field, shared across all chunks. Chunks are
+column-major, index `c * num_row_groups + g` (`ColumnChunkMatrix`, `footer-core-soa.thrift`).
+
+```text
+FileMetaData
+|
++-- row_groups: RowGroupMatrix
+|     num_rows            [ g0, g1, g2, ... gG ]            one i64 per row group
+|
++-- chunks: ColumnChunkMatrix        index = c * num_row_groups + g
+      data_page_offsets         [ chunk0, chunk1, chunk2, ... chunkN ]
+      dictionary_page_offsets   [ chunk0, chunk1, chunk2, ... chunkN ]
+      total_compressed_sizes    [ chunk0, chunk1, chunk2, ... chunkN ]
+      total_uncompressed_sizes  [ chunk0, chunk1, chunk2, ... chunkN ]
+      num_values                [ chunk0, chunk1, chunk2, ... chunkN ]
+      codecs                    [ chunk0, chunk1, chunk2, ... chunkN ]
+```
 
 ## Reading these tables
 
