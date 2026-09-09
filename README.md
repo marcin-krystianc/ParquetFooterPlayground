@@ -1,3 +1,6 @@
+### Previous versions:
+- [v2026-08](https://github.com/marcin-krystianc/ParquetFooterPlayground/tree/v2026-08)
+
 # Parquet footer benchmarks (2026)
 
 Parquet ([file format docs](https://parquet.apache.org/docs/file-format/)) stores its metadata
@@ -86,6 +89,51 @@ wanted chunks.
   parsing the whole footer, so it accelerates the pyarrow baseline and converges to it as the
   projection approaches 100%.
 
+### current vs soa layout
+
+Note, that these diagrams show only the placement-info fields this benchmark reads.
+See `footer-core-current.thrift` and `footer-core-soa.thrift` for the full
+field lists.
+
+- `current` is array-of-structs: one `ColumnMetaData` struct per chunk, each carrying its own
+copy of every field.
+
+```text
+FileMetaData
+|
++-- row_groups[0]
+|     +-- columns[0].meta_data -> ColumnMetaData { type, encodings, path_in_schema, codec,
+|     |                             num_values, total_uncompressed_size,
+|     |                             total_compressed_size, data_page_offset, ... }
+|     +-- columns[1].meta_data -> ColumnMetaData { same fields, own copy }
+|     +-- columns[N].meta_data -> ColumnMetaData { same fields, own copy }
+|
++-- row_groups[1]
+|     +-- columns[0].meta_data -> ColumnMetaData { ... }
+|     +-- columns[1].meta_data -> ColumnMetaData { ... }
+|     +-- columns[N].meta_data -> ColumnMetaData { ... }
+|
++-- row_groups[G] ...
+```
+
+- `soa` is struct-of-arrays: one parallel array per field, shared across all chunks. Chunks are
+column-major, index `c * num_row_groups + g` (`ColumnChunkMatrix`, `footer-core-soa.thrift`).
+
+```text
+FileMetaData
+|
++-- row_groups: RowGroupMatrix
+|     num_rows            [ g0, g1, g2, ... gG ]            one i64 per row group
+|
++-- chunks: ColumnChunkMatrix        index = c * num_row_groups + g
+      data_page_offsets         [ chunk0, chunk1, chunk2, ... chunkN ]
+      dictionary_page_offsets   [ chunk0, chunk1, chunk2, ... chunkN ]
+      total_compressed_sizes    [ chunk0, chunk1, chunk2, ... chunkN ]
+      total_uncompressed_sizes  [ chunk0, chunk1, chunk2, ... chunkN ]
+      num_values                [ chunk0, chunk1, chunk2, ... chunkN ]
+      codecs                    [ chunk0, chunk1, chunk2, ... chunkN ]
+```
+
 ## Reading these tables
 
 Values are `read_ms`: fastest wall-clock milliseconds over REPEATS runs. Note that the two categories
@@ -110,9 +158,9 @@ B) **FileMetaData producers** - return a full pyarrow `FileMetaData` object grap
              columns via its index, so it accelerates the pyarrow baseline and converges
              to it as projection -> 100%. (columns / row-groups sweeps only.)
 
-Each sweep prints two tables: `read_ms` (by projection) and `footer_bytes`. The `footer_bytes` is
-the serialized footer size each producer emits (independent of projection).
-It is a size-on-disk metric, not necessarily the bytes touched by a projected read.
+Each sweep prints two tables: `read_ms` (by projection) and `footer_bytes`, plus a chart for
+each. The `footer_bytes` is the serialized footer size each producer emits (independent of
+projection). It is a size-on-disk metric, not necessarily the bytes touched by a projected read.
 
 
 ## COLUMNS sweep — 100 row groups fixed
@@ -124,36 +172,38 @@ It is a size-on-disk metric, not necessarily the bytes touched by a projected re
 ```text
 format                           current    soa  soa_fb  soa_fb_lz4  soa_fb_lz4_verified  pyarrow  palletjack
 projection_pct n_columns chunks                                                                              
-10             4         400       0.126  0.014   0.000       0.006                0.006    0.196       0.055
-               8         800       0.230  0.025   0.000       0.011                0.011    0.367       0.054
-               16        1600      0.490  0.049   0.000       0.020                0.020    0.767       0.102
-               32        3200      0.926  0.096   0.000       0.039                0.039    1.427       0.148
-               64        6400      1.756  0.191   0.001       0.061                0.064    2.704       0.283
-               128       12800     3.529  0.369   0.001       0.096                0.096    5.324       0.622
-               256       25600     6.925  0.744   0.001       0.196                0.196   10.845       1.179
-               512       51200    13.512  1.489   0.003       0.402                0.406   21.644       2.229
-               1024      102400   27.465  3.065   0.005       0.800                0.802   44.007       4.287
-50             4         400       0.121  0.014   0.000       0.006                0.006    0.192       0.100
-               8         800       0.240  0.025   0.000       0.011                0.011    0.373       0.187
-               16        1600      0.459  0.049   0.001       0.020                0.021    0.754       0.366
-               32        3200      0.907  0.094   0.001       0.038                0.039    1.426       0.719
-               64        6400      1.740  0.187   0.002       0.061                0.064    2.717       1.379
-               128       12800     3.486  0.371   0.003       0.096                0.098    5.308       2.732
-               256       25600     6.779  0.749   0.006       0.199                0.200   10.919       5.374
-               512       51200    13.555  1.525   0.012       0.408                0.409   21.778      10.591
-               1024      102400   27.657  3.093   0.024       0.816                0.823   44.160      22.119
-90             4         400       0.121  0.014   0.000       0.006                0.006    0.191       0.191
-               8         800       0.238  0.025   0.001       0.011                0.011    0.368       0.302
-               16        1600      0.453  0.049   0.001       0.020                0.020    0.743       0.643
-               32        3200      0.864  0.096   0.002       0.039                0.041    1.429       1.268
-               64        6400      1.764  0.187   0.003       0.065                0.062    2.712       2.426
-               128       12800     3.451  0.372   0.005       0.099                0.101    5.330       4.776
-               256       25600     6.980  0.771   0.010       0.206                0.209   10.894       9.931
-               512       51200    13.634  1.523   0.020       0.415                0.417   21.478      19.824
-               1024      102400   27.963  3.069   0.041       0.831                0.835   44.191      39.940
+10             4         400       0.124  0.014   0.000       0.006                0.006    0.188       0.053
+               8         800       0.249  0.026   0.000       0.011                0.011    0.368       0.054
+               16        1600      0.474  0.050   0.000       0.020                0.020    0.755       0.102
+               32        3200      0.952  0.098   0.000       0.039                0.039    1.468       0.142
+               64        6400      1.822  0.193   0.001       0.061                0.064    2.680       0.265
+               128       12800     3.937  0.392   0.001       0.099                0.098    5.828       0.670
+               256       25600     7.116  0.757   0.002       0.195                0.195   10.459       1.175
+               512       51200    13.839  1.525   0.003       0.400                0.402   21.464       2.192
+               1024      102400   32.390  3.250   0.006       0.873                0.826   46.358       5.071
+50             4         400       0.125  0.014   0.000       0.006                0.006    0.191       0.104
+               8         800       0.242  0.029   0.001       0.012                0.011    0.365       0.185
+               16        1600      0.476  0.050   0.001       0.020                0.021    0.783       0.352
+               32        3200      0.939  0.098   0.001       0.039                0.039    1.455       0.721
+               64        6400      1.790  0.191   0.002       0.064                0.064    2.723       1.375
+               128       12800     3.803  0.415   0.003       0.106                0.106    6.036       2.846
+               256       25600     6.937  0.765   0.006       0.198                0.199   10.708       5.236
+               512       51200    13.831  1.532   0.012       0.408                0.410   21.850      10.855
+               1024      102400   29.730  3.381   0.026       0.867                0.859   46.057      23.312
+90             4         400       0.133  0.017   0.001       0.007                0.007    0.193       0.186
+               8         800       0.245  0.026   0.001       0.011                0.011    0.368       0.309
+               16        1600      0.474  0.049   0.001       0.022                0.021    0.777       0.636
+               32        3200      0.934  0.097   0.002       0.039                0.039    1.396       1.253
+               64        6400      1.830  0.192   0.003       0.065                0.062    2.694       2.637
+               128       12800     3.679  0.392   0.005       0.102                0.102    5.330       4.780
+               256       25600     6.888  0.775   0.010       0.202                0.205   10.950       9.685
+               512       51200    13.988  1.548   0.020       0.428                0.433   23.507      21.309
+               1024      102400   28.474  3.226   0.044       0.830                0.833   44.980      39.738
 ```
 
 **footer_bytes**
+
+![COLUMNS sweep — 100 row groups fixed — footer size](columns_sweep_bytes.png)
 
 ```text
 format             current       soa    soa_fb soa_fb_lz4 soa_fb_lz4_verified   pyarrow palletjack
@@ -178,36 +228,38 @@ n_columns chunks
 ```text
 format                              current    soa  soa_fb  soa_fb_lz4  soa_fb_lz4_verified  pyarrow  palletjack
 projection_pct n_row_groups chunks                                                                              
-10             4            400       0.122  0.022   0.000       0.006                0.007    0.321       0.029
-               8            800       0.231  0.034   0.000       0.010                0.010    0.496       0.046
-               16           1600      0.447  0.058   0.000       0.016                0.016    0.857       0.083
-               32           3200      0.922  0.103   0.000       0.029                0.029    1.517       0.144
-               64           6400      1.781  0.192   0.001       0.053                0.050    2.815       0.282
-               128          12800     3.460  0.364   0.001       0.096                0.097    5.284       0.586
-               256          25600     7.076  0.727   0.001       0.193                0.194   10.574       1.125
-               512          51200    13.669  1.477   0.002       0.391                0.390   21.374       2.293
-               1024         102400   27.971  2.960   0.004       0.812                0.810   43.148       4.432
-50             4            400       0.125  0.022   0.000       0.006                0.007    0.316       0.122
-               8            800       0.234  0.034   0.000       0.010                0.011    0.495       0.208
-               16           1600      0.452  0.057   0.001       0.016                0.017    0.861       0.370
-               32           3200      0.899  0.102   0.001       0.028                0.029    1.477       0.723
-               64           6400      1.778  0.189   0.002       0.048                0.052    2.724       1.392
-               128          12800     3.468  0.368   0.003       0.098                0.099    5.271       2.775
-               256          25600     6.787  0.727   0.005       0.196                0.198   10.490       5.241
-               512          51200    13.913  1.465   0.010       0.397                0.397   21.282      10.815
-               1024         102400   28.791  3.130   0.019       0.824                0.823   43.200      22.730
-90             4            400       0.122  0.023   0.001       0.006                0.007    0.320       0.211
-               8            800       0.228  0.034   0.001       0.010                0.011    0.479       0.364
-               16           1600      0.439  0.057   0.001       0.016                0.016    0.838       0.671
-               32           3200      0.898  0.102   0.001       0.028                0.029    1.493       1.287
-               64           6400      1.771  0.194   0.003       0.052                0.053    2.733       2.405
-               128          12800     3.522  0.373   0.005       0.098                0.101    5.306       4.701
-               256          25600     6.935  0.731   0.009       0.200                0.199   10.322       9.423
-               512          51200    14.213  1.479   0.017       0.405                0.404   21.302      19.656
-               1024         102400   28.585  2.989   0.034       0.835                0.835   43.318      39.256
+10             4            400       0.126  0.023   0.000       0.006                0.007    0.353       0.031
+               8            800       0.236  0.034   0.000       0.010                0.010    0.493       0.045
+               16           1600      0.460  0.059   0.000       0.016                0.016    0.851       0.081
+               32           3200      0.911  0.105   0.000       0.028                0.029    1.527       0.148
+               64           6400      1.840  0.197   0.001       0.052                0.049    2.900       0.289
+               128          12800     3.585  0.383   0.001       0.096                0.095    5.374       0.584
+               256          25600     7.066  0.741   0.001       0.191                0.193   10.652       1.177
+               512          51200    14.429  1.482   0.002       0.393                0.391   21.264       2.286
+               1024         102400   28.547  3.034   0.004       0.811                0.813   43.070       4.563
+50             4            400       0.128  0.025   0.000       0.007                0.007    0.336       0.135
+               8            800       0.238  0.035   0.000       0.010                0.010    0.512       0.211
+               16           1600      0.474  0.059   0.001       0.016                0.017    0.840       0.374
+               32           3200      0.962  0.106   0.001       0.029                0.029    1.523       0.736
+               64           6400      1.829  0.194   0.002       0.051                0.049    2.771       1.391
+               128          12800     3.574  0.385   0.003       0.100                0.101    5.404       2.655
+               256          25600     6.952  0.747   0.005       0.195                0.195   10.617       5.384
+               512          51200    14.201  1.549   0.010       0.409                0.399   21.601      10.778
+               1024         102400   28.997  2.986   0.019       0.824                0.821   43.772      22.573
+90             4            400       0.136  0.025   0.001       0.007                0.007    0.339       0.213
+               8            800       0.256  0.035   0.001       0.010                0.011    0.512       0.359
+               16           1600      0.459  0.059   0.001       0.016                0.016    0.820       0.694
+               32           3200      0.921  0.114   0.001       0.031                0.032    1.471       1.254
+               64           6400      1.819  0.199   0.002       0.053                0.054    2.830       2.419
+               128          12800     3.552  0.383   0.005       0.098                0.099    5.259       4.726
+               256          25600     7.150  0.766   0.010       0.205                0.200   10.773       9.812
+               512          51200    14.507  1.937   0.019       0.461                0.456   21.685      19.162
+               1024         102400   29.568  3.170   0.036       0.836                0.834   42.868      39.678
 ```
 
 **footer_bytes**
+
+![ROW-GROUPS sweep — 100 columns fixed — footer size](row_groups_sweep_bytes.png)
 
 ```text
 format                current       soa    soa_fb soa_fb_lz4 soa_fb_lz4_verified   pyarrow palletjack

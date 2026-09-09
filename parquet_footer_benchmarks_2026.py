@@ -1,4 +1,7 @@
-"""# Parquet footer benchmarks (2026)
+"""### Previous versions:
+- [v2026-08](https://github.com/marcin-krystianc/ParquetFooterPlayground/tree/v2026-08)
+
+# Parquet footer benchmarks (2026)
 
 Parquet ([file format docs](https://parquet.apache.org/docs/file-format/)) stores its metadata
 footer as a nested array of Thrift structs, which forces a reader to decode the whole footer even
@@ -59,6 +62,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import palletjack as pj
 from thriftpy2.protocol import TCompactProtocol, TCompactProtocolFactory
 from thriftpy2.transport import TMemoryBuffer
@@ -766,9 +770,14 @@ def run_benchmark():
 # Plots and tables
 # ---------------------------------------------------------------------------
 
-def plot_filename(sweep):
-    """PNG filename for a sweep's plot (also the relative link used in the README)."""
-    return f"{sweep.replace(' ', '_')}_sweep.png"
+def plot_filename(sweep, kind="read_ms"):
+    """PNG filename for a sweep's plot (also the relative link used in the README).
+
+    kind="read_ms" keeps the original bare `<sweep>_sweep.png` name; any other kind
+    (e.g. "bytes") gets its own suffixed file so the two plots don't collide.
+    """
+    suffix = "" if kind == "read_ms" else f"_{kind}"
+    return f"{sweep.replace(' ', '_')}_sweep{suffix}.png"
 
 
 colors = {
@@ -795,6 +804,51 @@ def plot_grid(table, sweep, x_label, title, path, *, xscale=None):
         ax.grid(alpha=.3, which="both")
     np.atleast_1d(axes)[0].legend()
     fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def plot_size(table, sweep, x_values, x_label, title, path):
+    """Render footer_bytes-vs-x (one line per format, log-log) to a PNG at `path`.
+
+    footer_bytes is constant across projection, so unlike plot_grid this is a single
+    panel, not a grid of one panel per projection. `x_values` (COLUMN_COUNTS or
+    ROW_GROUP_COUNTS) are the only x-axis ticks drawn: footer size spans kB to MB, and
+    the swept counts span 4 to 1024, so both axes need log scaling to stay readable,
+    but a matplotlib-autoscaled log axis picks decade ticks (10^0, 10^1, ...) that
+    don't line up with the actual data points. Pin ticks to the real x_values and to
+    the footer_bytes range instead, labelled as plain numbers / humanized sizes.
+
+    soa_fb_lz4_verified is skipped: it's the same buffer as soa_fb_lz4 (only the reader
+    differs), so its footer_bytes is identical and would just draw on top of that line.
+    """
+    data = table[table.sweep == sweep]
+    present = [f for f in DISPLAY_FORMATS if f in set(data.format) and f != "soa_fb_lz4_verified"]
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for fmt in present:
+        series = data[data.format == fmt].sort_values("x_value").drop_duplicates("x_value")
+        ax.plot(series.x_value, series.footer_bytes, marker="o", color=colors[fmt], label=fmt)
+
+    ax.set_xscale("log")
+    ax.set_xticks(x_values)
+    ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
+    ax.xaxis.set_minor_locator(mticker.NullLocator())
+
+    ymin, ymax = data.footer_bytes.min(), data.footer_bytes.max()
+    all_y_ticks = [n * 10 ** e for e in range(3, 8) for n in (1, 3)]
+    y_ticks = [t for t in all_y_ticks if ymin / 2 <= t <= ymax * 2]
+    ax.set_yscale("log")
+    ax.set_yticks(y_ticks)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: humanize.naturalsize(v)))
+    ax.yaxis.set_minor_locator(mticker.NullLocator())
+
+    ax.set_title(title)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("footer bytes")
+    ax.grid(alpha=.3, which="major")
+    ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -842,6 +896,51 @@ wanted chunks.
   metadata. Read fetches only the selected row groups/columns through the index instead of
   parsing the whole footer, so it accelerates the pyarrow baseline and converges to it as the
   projection approaches 100%.
+
+### current vs soa layout
+
+Note, that these diagrams show only the placement-info fields this benchmark reads.
+See `footer-core-current.thrift` and `footer-core-soa.thrift` for the full
+field lists.
+
+- `current` is array-of-structs: one `ColumnMetaData` struct per chunk, each carrying its own
+copy of every field.
+
+```text
+FileMetaData
+|
++-- row_groups[0]
+|     +-- columns[0].meta_data -> ColumnMetaData { type, encodings, path_in_schema, codec,
+|     |                             num_values, total_uncompressed_size,
+|     |                             total_compressed_size, data_page_offset, ... }
+|     +-- columns[1].meta_data -> ColumnMetaData { same fields, own copy }
+|     +-- columns[N].meta_data -> ColumnMetaData { same fields, own copy }
+|
++-- row_groups[1]
+|     +-- columns[0].meta_data -> ColumnMetaData { ... }
+|     +-- columns[1].meta_data -> ColumnMetaData { ... }
+|     +-- columns[N].meta_data -> ColumnMetaData { ... }
+|
++-- row_groups[G] ...
+```
+
+- `soa` is struct-of-arrays: one parallel array per field, shared across all chunks. Chunks are
+column-major, index `c * num_row_groups + g` (`ColumnChunkMatrix`, `footer-core-soa.thrift`).
+
+```text
+FileMetaData
+|
++-- row_groups: RowGroupMatrix
+|     num_rows            [ g0, g1, g2, ... gG ]            one i64 per row group
+|
++-- chunks: ColumnChunkMatrix        index = c * num_row_groups + g
+      data_page_offsets         [ chunk0, chunk1, chunk2, ... chunkN ]
+      dictionary_page_offsets   [ chunk0, chunk1, chunk2, ... chunkN ]
+      total_compressed_sizes    [ chunk0, chunk1, chunk2, ... chunkN ]
+      total_uncompressed_sizes  [ chunk0, chunk1, chunk2, ... chunkN ]
+      num_values                [ chunk0, chunk1, chunk2, ... chunkN ]
+      codecs                    [ chunk0, chunk1, chunk2, ... chunkN ]
+```
 """
 
 LEGEND = """\
@@ -869,9 +968,9 @@ B) **FileMetaData producers** - return a full pyarrow `FileMetaData` object grap
              columns via its index, so it accelerates the pyarrow baseline and converges
              to it as projection -> 100%. (columns / row-groups sweeps only.)
 
-Each sweep prints two tables: `read_ms` (by projection) and `footer_bytes`. The `footer_bytes` is
-the serialized footer size each producer emits (independent of projection).
-It is a size-on-disk metric, not necessarily the bytes touched by a projected read.
+Each sweep prints two tables: `read_ms` (by projection) and `footer_bytes`, plus a chart for
+each. The `footer_bytes` is the serialized footer size each producer emits (independent of
+projection). It is a size-on-disk metric, not necessarily the bytes touched by a projected read.
 """
 
 CONCLUSIONS = """\
@@ -977,6 +1076,7 @@ def markdown_report(results):
                 "**read_ms**\n",
                 "```text", _read_pivot(results, sweep, extra, x_name).to_string(), "```",
                 "\n**footer_bytes**\n",
+                f"![{title} — footer size]({plot_filename(sweep, 'bytes')})\n",
                 "```text", _size_pivot(results, sweep, extra, x_name).to_string(), "```",
             ]
     out += ["\n",CONCLUSIONS]
@@ -992,7 +1092,13 @@ def main():
                             "Columns sweep by projection", HERE / plot_filename("columns"))
     rowgroups_png = plot_grid(results, "row groups", "number of row groups",
                               "Row-group sweep by projection", HERE / plot_filename("row groups"))
-    print(f"wrote plots to {columns_png} and {rowgroups_png}")
+    columns_bytes_png = plot_size(results, "columns", COLUMN_COUNTS, "number of columns",
+                                  f"COLUMNS sweep — {ROW_GROUPS_FIXED} row groups fixed — footer size",
+                                  HERE / plot_filename("columns", "bytes"))
+    rowgroups_bytes_png = plot_size(results, "row groups", ROW_GROUP_COUNTS, "number of row groups",
+                                    f"ROW-GROUPS sweep — {COLUMNS_FIXED} columns fixed — footer size",
+                                    HERE / plot_filename("row groups", "bytes"))
+    print(f"wrote plots to {columns_png}, {rowgroups_png}, {columns_bytes_png} and {rowgroups_bytes_png}")
 
     readme = HERE / "README.md"
     readme.write_text(markdown_report(results))
