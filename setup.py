@@ -33,7 +33,7 @@ def codegen():
     GEN.mkdir(exist_ok=True)
     # Thrift derives C++ include-guard identifiers from the filename, and hyphens are
     # illegal in C++ identifiers, so generate from underscore-named copies.
-    for f in ("current", "jumptable", "soa"):
+    for f in ("current", "soa"):
         shutil.copyfile(HERE / f"footer-core-{f}.thrift", GEN / f"footer_core_{f}.thrift")
 
     # parquet.thrift carries an augmented supplementary-index block (struct SchemaLayout
@@ -47,7 +47,7 @@ def codegen():
     thrift = shutil.which("thrift")
     if thrift is None:
         raise SystemExit("thrift compiler not found on PATH (install thrift-compiler matching libthrift)")
-    for f in ("current", "jumptable", "soa"):
+    for f in ("current", "soa"):
         subprocess.run([thrift, "-r", "--gen", "cpp", "-out", str(GEN), str(GEN / f"footer_core_{f}.thrift")], check=True)
 
     flatc = shutil.which("flatc")

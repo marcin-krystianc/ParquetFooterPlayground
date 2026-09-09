@@ -18,11 +18,6 @@ ReadResult read_current_native(const uint8_t* data, std::size_t len, const int* 
 // (column-major chunk index c*nr + g).
 ReadResult read_soa_native(const uint8_t* data, std::size_t len, const int* cols, std::size_t ncols);
 
-// Decode only the jumptable header (first hlen bytes) to get the offset table, then
-// decode one ColumnMetaData per selected chunk from the body.
-ReadResult read_jumptable_native(const uint8_t* data, std::size_t len, const int* cols, std::size_t ncols,
-                                 std::size_t hlen, int nc, int nr);
-
 // Read a FlatBuffers SoA footer and sum data_page_offset / total_compressed_size over the selected
 // columns (column-major chunk index c*nr + g). compressed != 0 first LZ4_FRAME-decompresses `data`
 // into a raw_size buffer; compressed == 0 reads `data` directly (raw_size ignored). verify != 0 runs

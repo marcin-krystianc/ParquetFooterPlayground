@@ -1,6 +1,3 @@
-### Previous versions: 
-- [v2026-08](https://github.com/marcin-krystianc/ParquetFooterPlayground/tree/v2026-08)
-
 # Parquet footer benchmarks (2026)
 
 Parquet ([file format docs](https://parquet.apache.org/docs/file-format/)) stores its metadata
@@ -10,7 +7,7 @@ alternative footer layouts and encodings, as input to designing a new footer for
 the time to obtain `data_page_offset` and `total_compressed_size` for a projected subset of
 columns.
 
-Two sweeps compare footer encodings: `current`, `jumptable`, `soa`, and three FlatBuffers SoA
+Two sweeps compare footer encodings: `current`, `soa`, and three FlatBuffers SoA
 variants (`soa_fb`, `soa_fb_lz4`, `soa_fb_lz4_verified`). One sweep varies the number of columns,
 the other the number of row groups. Both also measure a second category, FileMetaData producers,
 over a real Parquet file: `pyarrow`, which parses the whole footer with no projection, and
@@ -62,12 +59,6 @@ wanted chunks.
   The protocol is linear, so to read any column you must decode every field of every chunk from
   the front. Cost grows with the whole footer, not with how many columns you asked for.
 
-- jumptable — the same per-chunk `ColumnMetaData` structs, but the header carries a flat table of
-  byte offsets, one per chunk, pointing into a body blob where each chunk's metadata is
-  serialized independently. A reader looks up the selected chunks in the offset table and
-  decodes only those, seeking past everything else. Trades a small offset table for projected
-  reads that scale with the number of columns requested, not the footer size.
-
 - soa (struct-of-arrays) — instead of one struct per chunk, store one parallel array per field
   across all chunks: all data_page_offsets together, all total_compressed_sizes together, and so
   on. Still Thrift compact and still decoded whole, but dropping the repeated per-chunk field
@@ -95,51 +86,6 @@ wanted chunks.
   parsing the whole footer, so it accelerates the pyarrow baseline and converges to it as the
   projection approaches 100%.
 
-### current vs soa layout
-
-Note, that these diagrams show only the placement-info fields this benchmark reads.
-See `footer-core-current.thrift` and `footer-core-soa.thrift` for the full
-field lists.
-
-- `current` is array-of-structs: one `ColumnMetaData` struct per chunk, each carrying its own
-copy of every field.
-
-```text
-FileMetaData
-|
-+-- row_groups[0]
-|     +-- columns[0].meta_data -> ColumnMetaData { type, encodings, path_in_schema, codec,
-|     |                             num_values, total_uncompressed_size,
-|     |                             total_compressed_size, data_page_offset, ... }
-|     +-- columns[1].meta_data -> ColumnMetaData { same fields, own copy }
-|     +-- columns[N].meta_data -> ColumnMetaData { same fields, own copy }
-|
-+-- row_groups[1]
-|     +-- columns[0].meta_data -> ColumnMetaData { ... }
-|     +-- columns[1].meta_data -> ColumnMetaData { ... }
-|     +-- columns[N].meta_data -> ColumnMetaData { ... }
-|
-+-- row_groups[G] ...
-```
-
-- `soa` is struct-of-arrays: one parallel array per field, shared across all chunks. Chunks are
-column-major, index `c * num_row_groups + g` (`ColumnChunkMatrix`, `footer-core-soa.thrift`).
-
-```text
-FileMetaData
-|
-+-- row_groups: RowGroupMatrix
-|     num_rows            [ g0, g1, g2, ... gG ]            one i64 per row group
-|
-+-- chunks: ColumnChunkMatrix        index = c * num_row_groups + g
-      data_page_offsets         [ chunk0, chunk1, chunk2, ... chunkN ]
-      dictionary_page_offsets   [ chunk0, chunk1, chunk2, ... chunkN ]
-      total_compressed_sizes    [ chunk0, chunk1, chunk2, ... chunkN ]
-      total_uncompressed_sizes  [ chunk0, chunk1, chunk2, ... chunkN ]
-      num_values                [ chunk0, chunk1, chunk2, ... chunkN ]
-      codecs                    [ chunk0, chunk1, chunk2, ... chunkN ]
-```
-
 ## Reading these tables
 
 Values are `read_ms`: fastest wall-clock milliseconds over REPEATS runs. Note that the two categories
@@ -148,7 +94,6 @@ are NOT directly comparable to each other:
 A) **Offset/size scanners** - decode the footer and SUM `data_page_offset` +
    `total_compressed_size` over the projected columns (return three integers):
 - current — native Thrift C++ — decodes the WHOLE footer (compact protocol is linear)
-- jumptable — native Thrift C++ — seeks to only the selected chunks via its offset table
 - soa — native Thrift C++ — decodes the whole struct-of-arrays footer
 - soa_fb — native FlatBuffers C++ — reads the uncompressed SoA footer directly and sums the
              two chunk vectors over the selected columns. Buffer is trusted (no verification).
@@ -177,51 +122,51 @@ It is a size-on-disk metric, not necessarily the bytes touched by a projected re
 **read_ms**
 
 ```text
-format                           current  jumptable    soa  soa_fb  soa_fb_lz4  soa_fb_lz4_verified  pyarrow  palletjack
-projection_pct n_columns chunks                                                                                         
-10             4         400       0.123      0.024  0.014   0.000       0.006                0.006    0.205       0.055
-               8         800       0.225      0.027  0.025   0.000       0.011                0.011    0.391       0.055
-               16        1600      0.437      0.048  0.048   0.000       0.020                0.020    0.779       0.109
-               32        3200      0.869      0.073  0.094   0.000       0.038                0.038    1.538       0.152
-               64        6400      1.690      0.159  0.184   0.001       0.060                0.063    2.933       0.278
-               128       12800     3.392      0.305  0.359   0.001       0.092                0.093    5.590       0.666
-               256       25600     6.674      0.607  0.731   0.001       0.190                0.192   11.136       1.198
-               512       51200    13.075      1.170  1.514   0.002       0.399                0.402   22.879       2.298
-               1024      102400   26.381      2.317  2.950   0.005       0.771                0.773   46.211       4.615
-50             4         400       0.117      0.042  0.014   0.000       0.006                0.006    0.213       0.107
-               8         800       0.231      0.083  0.025   0.000       0.011                0.011    0.413       0.196
-               16        1600      0.443      0.149  0.049   0.001       0.020                0.020    0.777       0.381
-               32        3200      0.867      0.305  0.094   0.001       0.038                0.039    1.485       0.777
-               64        6400      1.675      0.585  0.182   0.002       0.059                0.062    2.816       1.441
-               128       12800     3.313      1.163  0.364   0.003       0.094                0.096    5.611       2.794
-               256       25600     6.352      2.286  0.717   0.006       0.190                0.192   10.902       5.440
-               512       51200    12.745      4.556  1.453   0.011       0.390                0.391   23.622      10.950
-               1024      102400   26.129      9.318  2.947   0.022       0.795                0.801   46.367      22.816
-90             4         400       0.121      0.080  0.014   0.000       0.006                0.006    0.207       0.193
-               8         800       0.226      0.133  0.025   0.001       0.010                0.011    0.408       0.329
-               16        1600      0.438      0.258  0.048   0.001       0.020                0.020    0.779       0.659
-               32        3200      0.877      0.519  0.095   0.001       0.038                0.038    1.495       1.329
-               64        6400      1.684      1.030  0.184   0.003       0.063                0.063    2.827       2.551
-               128       12800     3.302      2.013  0.360   0.005       0.097                0.099    5.558       4.873
-               256       25600     6.438      3.982  0.718   0.009       0.199                0.196   11.248       9.666
-               512       51200    12.893      8.116  1.472   0.019       0.398                0.401   22.905      20.146
-               1024      102400   27.083     16.232  3.060   0.039       0.802                0.800   46.702      41.998
+format                           current    soa  soa_fb  soa_fb_lz4  soa_fb_lz4_verified  pyarrow  palletjack
+projection_pct n_columns chunks                                                                              
+10             4         400       0.126  0.014   0.000       0.006                0.006    0.196       0.055
+               8         800       0.230  0.025   0.000       0.011                0.011    0.367       0.054
+               16        1600      0.490  0.049   0.000       0.020                0.020    0.767       0.102
+               32        3200      0.926  0.096   0.000       0.039                0.039    1.427       0.148
+               64        6400      1.756  0.191   0.001       0.061                0.064    2.704       0.283
+               128       12800     3.529  0.369   0.001       0.096                0.096    5.324       0.622
+               256       25600     6.925  0.744   0.001       0.196                0.196   10.845       1.179
+               512       51200    13.512  1.489   0.003       0.402                0.406   21.644       2.229
+               1024      102400   27.465  3.065   0.005       0.800                0.802   44.007       4.287
+50             4         400       0.121  0.014   0.000       0.006                0.006    0.192       0.100
+               8         800       0.240  0.025   0.000       0.011                0.011    0.373       0.187
+               16        1600      0.459  0.049   0.001       0.020                0.021    0.754       0.366
+               32        3200      0.907  0.094   0.001       0.038                0.039    1.426       0.719
+               64        6400      1.740  0.187   0.002       0.061                0.064    2.717       1.379
+               128       12800     3.486  0.371   0.003       0.096                0.098    5.308       2.732
+               256       25600     6.779  0.749   0.006       0.199                0.200   10.919       5.374
+               512       51200    13.555  1.525   0.012       0.408                0.409   21.778      10.591
+               1024      102400   27.657  3.093   0.024       0.816                0.823   44.160      22.119
+90             4         400       0.121  0.014   0.000       0.006                0.006    0.191       0.191
+               8         800       0.238  0.025   0.001       0.011                0.011    0.368       0.302
+               16        1600      0.453  0.049   0.001       0.020                0.020    0.743       0.643
+               32        3200      0.864  0.096   0.002       0.039                0.041    1.429       1.268
+               64        6400      1.764  0.187   0.003       0.065                0.062    2.712       2.426
+               128       12800     3.451  0.372   0.005       0.099                0.101    5.330       4.776
+               256       25600     6.980  0.771   0.010       0.206                0.209   10.894       9.931
+               512       51200    13.634  1.523   0.020       0.415                0.417   21.478      19.824
+               1024      102400   27.963  3.069   0.041       0.831                0.835   44.191      39.940
 ```
 
 **footer_bytes**
 
 ```text
-format             current jumptable       soa    soa_fb soa_fb_lz4 soa_fb_lz4_verified   pyarrow palletjack
-n_columns chunks                                                                                            
-4         400      20.9 kB   10.1 kB    6.7 kB   19.0 kB     7.1 kB              7.1 kB   43.8 kB    47.1 kB
-8         800      41.0 kB   20.4 kB   13.4 kB   36.8 kB    14.1 kB             14.1 kB   86.1 kB    91.1 kB
-16        1600     80.6 kB   40.8 kB   27.0 kB   72.5 kB    27.5 kB             27.5 kB  171.4 kB   179.8 kB
-32        3200    161.5 kB   83.2 kB   55.3 kB  143.9 kB    55.4 kB             55.4 kB  342.3 kB   357.4 kB
-64        6400    321.7 kB  166.6 kB  111.0 kB  286.6 kB   110.0 kB            110.0 kB  683.9 kB   712.5 kB
-128       12800   643.8 kB  334.8 kB  223.4 kB  572.0 kB   220.7 kB            220.7 kB    1.4 MB     1.4 MB
-256       25600     1.3 MB  670.0 kB  447.4 kB    1.1 MB   439.8 kB            439.8 kB    2.8 MB     2.9 MB
-512       51200     2.6 MB    1.3 MB  896.1 kB    2.3 MB   881.0 kB            881.0 kB    5.6 MB     5.8 MB
-1024      102400    5.1 MB    2.7 MB    1.8 MB    4.6 MB     1.8 MB              1.8 MB   11.2 MB    11.7 MB
+format             current       soa    soa_fb soa_fb_lz4 soa_fb_lz4_verified   pyarrow palletjack
+n_columns chunks                                                                                  
+4         400      20.9 kB    6.7 kB   19.0 kB     7.1 kB              7.1 kB   43.8 kB    47.1 kB
+8         800      41.0 kB   13.4 kB   36.8 kB    14.1 kB             14.1 kB   86.1 kB    91.1 kB
+16        1600     80.6 kB   27.0 kB   72.5 kB    27.5 kB             27.5 kB  171.4 kB   179.8 kB
+32        3200    161.5 kB   55.3 kB  143.9 kB    55.4 kB             55.4 kB  342.3 kB   357.4 kB
+64        6400    321.7 kB  111.0 kB  286.6 kB   110.0 kB            110.0 kB  683.9 kB   712.5 kB
+128       12800   643.8 kB  223.4 kB  572.0 kB   220.7 kB            220.7 kB    1.4 MB     1.4 MB
+256       25600     1.3 MB  447.4 kB    1.1 MB   439.8 kB            439.8 kB    2.8 MB     2.9 MB
+512       51200     2.6 MB  896.1 kB    2.3 MB   881.0 kB            881.0 kB    5.6 MB     5.8 MB
+1024      102400    5.1 MB    1.8 MB    4.6 MB     1.8 MB              1.8 MB   11.2 MB    11.7 MB
 ```
 
 ## ROW-GROUPS sweep — 100 columns fixed
@@ -231,51 +176,51 @@ n_columns chunks
 **read_ms**
 
 ```text
-format                              current  jumptable    soa  soa_fb  soa_fb_lz4  soa_fb_lz4_verified  pyarrow  palletjack
-projection_pct n_row_groups chunks                                                                                         
-10             4            400       0.122      0.023  0.022   0.000       0.006                0.007    0.355       0.028
-               8            800       0.219      0.034  0.033   0.000       0.010                0.010    0.534       0.049
-               16           1600      0.667      0.077  0.082   0.001       0.021                0.016    0.936       0.084
-               32           3200      0.864      0.086  0.101   0.000       0.028                0.028    1.638       0.165
-               64           6400      1.706      0.156  0.187   0.001       0.048                0.051    2.915       0.304
-               128          12800     3.312      0.289  0.361   0.001       0.093                0.095    5.525       0.602
-               256          25600     6.712      0.565  0.697   0.001       0.188                0.185   10.718       1.181
-               512          51200    13.338      1.129  1.414   0.002       0.388                0.387   22.260       2.316
-               1024         102400   26.470      2.253  2.793   0.004       0.779                0.776   45.947       4.704
-50             4            400       0.117      0.051  0.022   0.000       0.006                0.007    0.358       0.128
-               8            800       0.228      0.087  0.033   0.001       0.010                0.010    0.542       0.212
-               16           1600      0.436      0.163  0.056   0.001       0.016                0.016    0.885       0.405
-               32           3200      0.842      0.295  0.097   0.001       0.027                0.028    1.579       0.776
-               64           6400      1.649      0.573  0.183   0.001       0.047                0.050    2.916       1.398
-               128          12800     3.222      1.202  0.363   0.003       0.095                0.096    5.619       2.804
-               256          25600     6.692      2.326  0.717   0.005       0.193                0.193   11.036       5.575
-               512          51200    12.817      4.688  1.428   0.009       0.404                0.409   22.021      10.971
-               1024         102400   27.070      9.103  2.830   0.018       0.808                0.808   45.004      23.295
-90             4            400       0.121      0.079  0.022   0.001       0.006                0.007    0.339       0.217
-               8            800       0.223      0.143  0.033   0.001       0.010                0.010    0.555       0.390
-               16           1600      0.438      0.277  0.057   0.001       0.016                0.016    0.893       0.728
-               32           3200      0.845      0.522  0.102   0.001       0.029                0.029    1.636       1.342
-               64           6400      1.644      1.026  0.182   0.002       0.050                0.048    2.836       2.569
-               128          12800     3.351      2.092  0.371   0.005       0.099                0.100    5.663       4.972
-               256          25600     6.618      4.099  0.738   0.009       0.197                0.197   11.406      10.179
-               512          51200    13.506      8.043  1.446   0.016       0.409                0.408   22.397      20.129
-               1024         102400   27.402     16.125  2.911   0.032       0.806                0.805   45.312      40.727
+format                              current    soa  soa_fb  soa_fb_lz4  soa_fb_lz4_verified  pyarrow  palletjack
+projection_pct n_row_groups chunks                                                                              
+10             4            400       0.122  0.022   0.000       0.006                0.007    0.321       0.029
+               8            800       0.231  0.034   0.000       0.010                0.010    0.496       0.046
+               16           1600      0.447  0.058   0.000       0.016                0.016    0.857       0.083
+               32           3200      0.922  0.103   0.000       0.029                0.029    1.517       0.144
+               64           6400      1.781  0.192   0.001       0.053                0.050    2.815       0.282
+               128          12800     3.460  0.364   0.001       0.096                0.097    5.284       0.586
+               256          25600     7.076  0.727   0.001       0.193                0.194   10.574       1.125
+               512          51200    13.669  1.477   0.002       0.391                0.390   21.374       2.293
+               1024         102400   27.971  2.960   0.004       0.812                0.810   43.148       4.432
+50             4            400       0.125  0.022   0.000       0.006                0.007    0.316       0.122
+               8            800       0.234  0.034   0.000       0.010                0.011    0.495       0.208
+               16           1600      0.452  0.057   0.001       0.016                0.017    0.861       0.370
+               32           3200      0.899  0.102   0.001       0.028                0.029    1.477       0.723
+               64           6400      1.778  0.189   0.002       0.048                0.052    2.724       1.392
+               128          12800     3.468  0.368   0.003       0.098                0.099    5.271       2.775
+               256          25600     6.787  0.727   0.005       0.196                0.198   10.490       5.241
+               512          51200    13.913  1.465   0.010       0.397                0.397   21.282      10.815
+               1024         102400   28.791  3.130   0.019       0.824                0.823   43.200      22.730
+90             4            400       0.122  0.023   0.001       0.006                0.007    0.320       0.211
+               8            800       0.228  0.034   0.001       0.010                0.011    0.479       0.364
+               16           1600      0.439  0.057   0.001       0.016                0.016    0.838       0.671
+               32           3200      0.898  0.102   0.001       0.028                0.029    1.493       1.287
+               64           6400      1.771  0.194   0.003       0.052                0.053    2.733       2.405
+               128          12800     3.522  0.373   0.005       0.098                0.101    5.306       4.701
+               256          25600     6.935  0.731   0.009       0.200                0.199   10.322       9.423
+               512          51200    14.213  1.479   0.017       0.405                0.404   21.302      19.656
+               1024         102400   28.585  2.989   0.034       0.835                0.835   43.318      39.256
 ```
 
 **footer_bytes**
 
 ```text
-format                current jumptable       soa    soa_fb soa_fb_lz4 soa_fb_lz4_verified   pyarrow palletjack
-n_row_groups chunks                                                                                            
-4            400      21.8 kB   11.6 kB    8.2 kB   24.0 kB     9.6 kB              9.6 kB   50.1 kB    53.9 kB
-8            800      41.3 kB   21.5 kB   14.7 kB   41.6 kB    16.0 kB             16.0 kB   92.6 kB    98.0 kB
-16           1600     81.3 kB   42.2 kB   28.4 kB   76.9 kB    29.6 kB             29.6 kB  177.4 kB   186.1 kB
-32           3200    161.5 kB   83.9 kB   56.1 kB  147.4 kB    56.7 kB             56.7 kB  347.2 kB   362.5 kB
-64           6400    322.0 kB  167.2 kB  111.7 kB  288.4 kB   110.8 kB            110.8 kB  686.6 kB   715.3 kB
-128          12800   643.0 kB  334.0 kB  222.7 kB  570.6 kB   219.6 kB            219.6 kB    1.4 MB     1.4 MB
-256          25600     1.3 MB  667.4 kB  444.8 kB    1.1 MB   438.7 kB            438.7 kB    2.8 MB     2.9 MB
-512          51200     2.6 MB    1.3 MB  888.9 kB    2.3 MB   890.6 kB            890.6 kB    5.5 MB     5.7 MB
-1024         102400    5.1 MB    2.7 MB    1.8 MB    4.5 MB     1.8 MB              1.8 MB   11.1 MB    11.5 MB
+format                current       soa    soa_fb soa_fb_lz4 soa_fb_lz4_verified   pyarrow palletjack
+n_row_groups chunks                                                                                  
+4            400      21.8 kB    8.2 kB   24.0 kB     9.6 kB              9.6 kB   50.1 kB    53.9 kB
+8            800      41.3 kB   14.7 kB   41.6 kB    16.0 kB             16.0 kB   92.6 kB    98.0 kB
+16           1600     81.3 kB   28.4 kB   76.9 kB    29.6 kB             29.6 kB  177.4 kB   186.1 kB
+32           3200    161.5 kB   56.1 kB  147.4 kB    56.7 kB             56.7 kB  347.2 kB   362.5 kB
+64           6400    322.0 kB  111.7 kB  288.4 kB   110.8 kB            110.8 kB  686.6 kB   715.3 kB
+128          12800   643.0 kB  222.7 kB  570.6 kB   219.6 kB            219.6 kB    1.4 MB     1.4 MB
+256          25600     1.3 MB  444.8 kB    1.1 MB   438.7 kB            438.7 kB    2.8 MB     2.9 MB
+512          51200     2.6 MB  888.9 kB    2.3 MB   890.6 kB            890.6 kB    5.5 MB     5.7 MB
+1024         102400    5.1 MB    1.8 MB    4.5 MB     1.8 MB              1.8 MB   11.1 MB    11.5 MB
 ```
 
 
@@ -286,11 +231,6 @@ Read speed:
   `ColumnChunk`/`ColumnMetaData` framing and the per-chunk field tags that "current" repeats for
   every chunk. The Thrift compact decoder therefore parses far fewer fields for the same
   information.
-- jumptable wins most at low projection. It decodes the header's offset table once, then fully
-  decodes only the selected chunks and seeks past the rest; current and soa decode every chunk
-  regardless of projection. jumptable still reads the whole offset table, so its cost is that
-  pass plus the selected chunks (not purely the projection), and its advantage shrinks as
-  projection approaches 100%.
 - soa_fb is faster than soa. FlatBuffers needs no decode pass at all: "soa" runs the Thrift
   compact decoder over the entire footer (varint parsing + building vectors), while "soa_fb"
   casts the buffer and reads the two chunk vectors it needs directly. Its cost is O(selected
@@ -317,7 +257,7 @@ Footer size (`footer_bytes`):
   offsets, while pyarrow measures a real, full footer that carries all of them.
 
 Decoder caveat:
-- The current, jumptable and soa readers use the generic Thrift compact decoder emitted by the
+- The current and soa readers use the generic Thrift compact decoder emitted by the
   Thrift compiler, which is not necessarily the most optimal Thrift parser; a hand-written decoder
   could do less per-field work. The current layout has the most headroom, since much of its cost is
   per-field dispatch across the nested per-chunk structs. For the soa layout the generic decoder is

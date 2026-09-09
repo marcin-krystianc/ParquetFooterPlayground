@@ -1,6 +1,5 @@
 #include "shim.h"
 #include "footer_core_current_types.h"
-#include "footer_core_jumptable_types.h"
 #include "footer_core_soa_types.h"
 #include "footer_core_flatbuffers_generated.h"
 
@@ -51,31 +50,6 @@ ReadResult read_soa_native(const uint8_t* data, std::size_t len, const int* cols
             r.count++;
             r.offset_sum += offs[i];
             r.size_sum += sizes[i];
-        }
-    }
-    return r;
-}
-
-ReadResult read_jumptable_native(const uint8_t* data, std::size_t len, const int* cols, std::size_t ncols,
-                                 std::size_t hlen, int nc, int nr) {
-    footer::core::jumptable::FileMetaData hdr;
-    decode(hdr, data, hlen);
-    const auto& rel = hdr.column_metadata_offsets;
-    const std::size_t body_len = len - hlen;
-    ReadResult r{0, 0, 0};
-    for (int g = 0; g < nr; ++g) {
-        for (std::size_t k = 0; k < ncols; ++k) {
-            const int c = cols[k];
-            const int j = g * nc + c;
-            const int32_t start = rel[j];
-            const int32_t end = (static_cast<std::size_t>(j + 1) < rel.size())
-                                    ? rel[j + 1]
-                                    : static_cast<int32_t>(body_len);
-            footer::core::jumptable::ColumnMetaData m;
-            decode(m, data + hlen + start, static_cast<std::size_t>(end - start));
-            r.count++;
-            r.offset_sum += m.data_page_offset;
-            r.size_sum += m.total_compressed_size;
         }
     }
     return r;

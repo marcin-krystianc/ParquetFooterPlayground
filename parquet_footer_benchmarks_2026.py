@@ -7,7 +7,7 @@ alternative footer layouts and encodings, as input to designing a new footer for
 the time to obtain `data_page_offset` and `total_compressed_size` for a projected subset of
 columns.
 
-Two sweeps compare footer encodings: `current`, `jumptable`, `soa`, and three FlatBuffers SoA
+Two sweeps compare footer encodings: `current`, `soa`, and three FlatBuffers SoA
 variants (`soa_fb`, `soa_fb_lz4`, `soa_fb_lz4_verified`). One sweep varies the number of columns,
 the other the number of row groups. Both also measure a second category, FileMetaData producers,
 over a real Parquet file: `pyarrow`, which parses the whole footer with no projection, and
@@ -77,13 +77,12 @@ def load_thrift(file, module):
 
 # The three footer IDLs plus the full Parquet IDL they share (reached as `current_thrift.parquet`).
 current_thrift = load_thrift("footer-core-current.thrift", "nb_current_thrift")
-jumptable_thrift = load_thrift("footer-core-jumptable.thrift", "nb_jumptable_thrift")
 soa_thrift = load_thrift("footer-core-soa.thrift", "nb_soa_thrift")
 parquet_thrift = current_thrift.parquet
 
-# Category A: offset/size scanners. All six encode the SAME synthetic footer contents (one Meta),
+# Category A: offset/size scanners. All five encode the SAME synthetic footer contents (one Meta),
 # so their read results must match; only the encoding/read strategy differs.
-FORMATS = ["current", "jumptable", "soa", "soa_fb", "soa_fb_lz4", "soa_fb_lz4_verified"]
+FORMATS = ["current", "soa", "soa_fb", "soa_fb_lz4", "soa_fb_lz4_verified"]
 # Category B: pyarrow + palletjack read a REAL Parquet file and return a pyarrow FileMetaData
 # object graph (much heavier per chunk than a sum); they are compared against each other.
 DISPLAY_FORMATS = FORMATS + ["pyarrow", "palletjack"]
@@ -261,34 +260,6 @@ def build_current(meta):
     return dict(fmt="current", buf=buf, num_columns=meta.columns, num_row_groups=meta.row_groups, size=len(buf))
 
 
-def build_jumptable(meta):
-    """Header holds a flat table of byte offsets; each ColumnMetaData is serialized separately into
-    the body, so a reader can seek straight to a selected chunk instead of decoding everything."""
-    chunk_offsets = [0] * meta.chunks   # row-group-major: chunk_offsets[rg * columns + col]
-    body = bytearray()
-    for rg in range(meta.row_groups):
-        for col in range(meta.columns):
-            i = meta.idx(col, rg)
-            chunk_offsets[rg * meta.columns + col] = len(body)
-            body += serialize(jumptable_thrift.ColumnMetaData(
-                codec=meta.codecs[i],
-                num_values=meta.num_values[i],
-                total_uncompressed_size=meta.uncompressed_sizes[i],
-                total_compressed_size=meta.compressed_sizes[i],
-                data_page_offset=meta.data_page_offsets[i],
-                dictionary_page_offset=opt_offset(meta.dict_page_offsets[i]),
-            ), COMPACT_PROTOCOL)
-    header = serialize(jumptable_thrift.FileMetaData(
-        version=2,
-        schema=thrift_schema(jumptable_thrift, meta),
-        row_groups=[jumptable_thrift.RowGroup(columns=[], num_rows=r) for r in meta.rows],
-        column_metadata_offsets=chunk_offsets,
-    ), COMPACT_PROTOCOL)
-    buf = header + bytes(body)
-    return dict(fmt="jumptable", buf=buf, header_len=len(header),
-                num_columns=meta.columns, num_row_groups=meta.row_groups, size=len(buf))
-
-
 def build_soa(meta):
     """Struct-of-arrays footer: one parallel Thrift list per field, across all chunks."""
     schema_matrix = soa_thrift.SchemaMatrix(
@@ -447,7 +418,6 @@ def build_soa_fb_lz4_verified(meta):
 
 BUILDERS = {
     "current": build_current,
-    "jumptable": build_jumptable,
     "soa": build_soa,
     "soa_fb": build_soa_fb,
     "soa_fb_lz4": build_soa_fb_lz4,
@@ -582,10 +552,6 @@ def read_current(footer, columns):
 def read_soa(footer, columns):
     return load_native().soa(footer["buf"], columns)
 
-def read_jumptable(footer, columns):
-    return load_native().jumptable(footer["buf"], columns,
-                                   footer["header_len"], footer["num_columns"], footer["num_row_groups"])
-
 # The three FlatBuffers angles all call the same native reader with (verify, compressed) flags:
 #   soa_fb               verify=0 compressed=0  (pure FlatBuffers, buffer trusted)
 #   soa_fb_lz4           verify=0 compressed=1  (LZ4 decompress + scan)
@@ -602,7 +568,6 @@ def read_soa_fb_lz4_verified(footer, columns):
 
 READERS = {
     "current": read_current,
-    "jumptable": read_jumptable,
     "soa": read_soa,
     "soa_fb": read_soa_fb,
     "soa_fb_lz4": read_soa_fb_lz4,
@@ -636,27 +601,7 @@ def read_soa_tp2(footer, columns):
             size_sum += sizes[i]
     return count, offset_sum, size_sum
 
-def read_jumptable_tp2(footer, columns):
-    buf = footer["buf"]
-    header_len = footer["header_len"]
-    n_columns = footer["num_columns"]
-    n_row_groups = footer["num_row_groups"]
-    chunk_offsets = deserialize(jumptable_thrift.FileMetaData(), buf[:header_len], COMPACT_PROTOCOL).column_metadata_offsets
-    body_len = len(buf) - header_len
-    count = offset_sum = size_sum = 0
-    for rg in range(n_row_groups):
-        for col in columns:
-            j = rg * n_columns + col
-            start = chunk_offsets[j]
-            end = chunk_offsets[j + 1] if j + 1 < len(chunk_offsets) else body_len
-            m = jumptable_thrift.ColumnMetaData()
-            m.read(TCompactProtocol(TMemoryBuffer(buf[header_len + start: header_len + end])))
-            count += 1
-            offset_sum += m.data_page_offset
-            size_sum += m.total_compressed_size
-    return count, offset_sum, size_sum
-
-TP2_READERS = {"current": read_current_tp2, "jumptable": read_jumptable_tp2, "soa": read_soa_tp2}
+TP2_READERS = {"current": read_current_tp2, "soa": read_soa_tp2}
 
 
 def projected_columns(meta, projection, seed):
@@ -827,7 +772,7 @@ def plot_filename(sweep):
 
 
 colors = {
-    "current": "#d62728", "jumptable": "#1f77b4", "soa": "#2ca02c",
+    "current": "#d62728", "soa": "#2ca02c",
     "soa_fb": "#8c564b", "soa_fb_lz4": "#e377c2", "soa_fb_lz4_verified": "#17becf",
     "pyarrow": "#7f7f7f", "palletjack": "#ff7f0e",
 }
@@ -871,12 +816,6 @@ wanted chunks.
   The protocol is linear, so to read any column you must decode every field of every chunk from
   the front. Cost grows with the whole footer, not with how many columns you asked for.
 
-- jumptable — the same per-chunk `ColumnMetaData` structs, but the header carries a flat table of
-  byte offsets, one per chunk, pointing into a body blob where each chunk's metadata is
-  serialized independently. A reader looks up the selected chunks in the offset table and
-  decodes only those, seeking past everything else. Trades a small offset table for projected
-  reads that scale with the number of columns requested, not the footer size.
-
 - soa (struct-of-arrays) — instead of one struct per chunk, store one parallel array per field
   across all chunks: all data_page_offsets together, all total_compressed_sizes together, and so
   on. Still Thrift compact and still decoded whole, but dropping the repeated per-chunk field
@@ -914,7 +853,6 @@ are NOT directly comparable to each other:
 A) **Offset/size scanners** - decode the footer and SUM `data_page_offset` +
    `total_compressed_size` over the projected columns (return three integers):
 - current — native Thrift C++ — decodes the WHOLE footer (compact protocol is linear)
-- jumptable — native Thrift C++ — seeks to only the selected chunks via its offset table
 - soa — native Thrift C++ — decodes the whole struct-of-arrays footer
 - soa_fb — native FlatBuffers C++ — reads the uncompressed SoA footer directly and sums the
              two chunk vectors over the selected columns. Buffer is trusted (no verification).
@@ -944,11 +882,6 @@ Read speed:
   `ColumnChunk`/`ColumnMetaData` framing and the per-chunk field tags that "current" repeats for
   every chunk. The Thrift compact decoder therefore parses far fewer fields for the same
   information.
-- jumptable wins most at low projection. It decodes the header's offset table once, then fully
-  decodes only the selected chunks and seeks past the rest; current and soa decode every chunk
-  regardless of projection. jumptable still reads the whole offset table, so its cost is that
-  pass plus the selected chunks (not purely the projection), and its advantage shrinks as
-  projection approaches 100%.
 - soa_fb is faster than soa. FlatBuffers needs no decode pass at all: "soa" runs the Thrift
   compact decoder over the entire footer (varint parsing + building vectors), while "soa_fb"
   casts the buffer and reads the two chunk vectors it needs directly. Its cost is O(selected
@@ -975,7 +908,7 @@ Footer size (`footer_bytes`):
   offsets, while pyarrow measures a real, full footer that carries all of them.
 
 Decoder caveat:
-- The current, jumptable and soa readers use the generic Thrift compact decoder emitted by the
+- The current and soa readers use the generic Thrift compact decoder emitted by the
   Thrift compiler, which is not necessarily the most optimal Thrift parser; a hand-written decoder
   could do less per-field work. The current layout has the most headroom, since much of its cost is
   per-field dispatch across the nested per-chunk structs. For the soa layout the generic decoder is
